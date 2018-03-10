@@ -1,0 +1,213 @@
+---
+title: "Titanic ML"
+output: html_document
+---
+
+Following along at [this kaggle notebook]("https://www.kaggle.com/mrisdal/exploring-survival-on-the-titanic/notebook").
+
+
+Libraries
+```{r}
+library(tidyverse)
+library(stringr)
+library(ggthemes) # visualization
+library(scales) # visualization
+library(mice) # imputation
+library(randomForest) # classification algorithm
+library(cowplot) # nice plots
+```
+
+
+Data
+```{r}
+train <- read.csv("train.csv")
+test <- read.csv("test.csv")
+
+full <- bind_rows(train, test) # test data doesn't have susrvived column
+
+str(full)
+```
+
+
+Feature Engineering  
+
+* passenger name has titles and surnames  
+    + titles indicate sex position, marriage  
+    + surnames indicate family  
+    
+```{r}
+# make colnames lowercase because it's easier to type
+colnames(full) <- colnames(full) %>% tolower()
+
+full %>% 
+  separate(col = name, into = c('surname', 'fullname'), sep = ", ") %>% 
+  separate(col = fullname, into = c('title', 'name'), sep = "[\\.]") -> full
+
+# see table of sex and title counts
+table(full$sex, full$title)
+
+# who is the countess and the Jonkheer (Dutch nobility)?
+full %>% filter(title == "the Countess") # she survived!
+full %>% filter(title == "Jonkheer") # looks like the nobleman died.
+
+```
+
+Titles with low counts combined to "rare"
+```{r}
+full %>% group_by(title) %>% count() %>% arrange(-n) -> temp
+rare_titles <- temp[5:nrow(temp), 1] %>% unlist()
+
+# reassign mlle (unmarried - miss), ms (unmarried - miss), and mme (married - mrs) 
+full$title[full$title == "Mlle"] <- "Miss"
+full$title[full$title == "Ms"] <- "Miss"
+full$title[full$title == "Mme"] <- "Mrs"
+
+# reassign rare titles
+full$title[full$title %in% rare_titles] <- "Rare Title"
+
+# show title counts by sex again
+table(full$sex, full$title)
+
+```
+
+
+Do families sink or swim together?
+```{r}
+unique(full$surname) %>% length() # 875 unique surnames 
+
+# create family size variable including passenger themselves
+full$family_size <- full$sibsp + full$parch + 1
+
+# create family variable 
+full$family <- paste(full$surname, full$family_size, sep = "_")
+
+unique(full$family) %>% length() # 928 unique families
+
+# visualize
+ggplot(full %>% filter(!is.na(survived))) + geom_histogram(aes(family_size, fill = factor(survived)), position = "dodge") + scale_x_continuous(breaks = c(1:max(full$family_size)))
+
+# there's a survival penalty to singles, and families above size 4
+```
+
+
+Discretize family size variable
+```{r}
+full$family_size_bin[full$family_size == 1] <- "single"
+full$family_size_bin[full$family_size < 5 & full$family_size > 1] <- "small"
+full$family_size_bin[full$family_size > 4] <- "large"
+
+# show family size by survival using a mosaic plot
+mosaicplot(table(full$family_size_bin, full$survived), 
+           main='Family Size by Survival',
+           ylab = "survived",
+           shade=TRUE)
+```
+
+
+Make some more variables
+```{r}
+full %>% group_by(cabin) %>% count() # lots of missing values
+
+# get deck - first character of cabin variable
+full$deck <- substr(full$cabin,1,1)
+
+```
+
+
+Missingness  
+
+* don't want to delete rows containing missing data  
+* so we impute: replace missing values with sensible values given the distirbution of the data:  
+    + mean, median, mode
+    + prediction  
+
+Find missing values
+```{r}
+# missing values can be NA, NULL, or "", so write a function that finds missing values
+find_missing_values <- function(col_name, df){
+  df %>% filter(is.na(get(col_name)) | get(col_name) == "" | is.null(get(col_name)))
+}
+
+# apply this function over the column names of our df
+col_names <- colnames(full)
+missing_vals <- lapply(col_names, find_missing_values, df = full)
+names(missing_vals) <- col_names
+
+# explore missing values
+str(missing_vals, list.len = 18, max.level = 1)
+
+# survived, age, fare, cabin, embarked, and deck all have missing values. survived is expected, as this reflects our test data
+```
+
+
+Sensible Value Imputation 
+
+We infer where they embarked from by information that we imagine is relevant:  
+ 
+* passenger class  
+* fare  
+```{r}
+# start with embarked because it's small. what passengers don't have info?
+missing_vals['embarked'] 
+
+full[c(62, 830), 'embarked'] # passengers 62 and 830 are missing embarked info
+
+# let's look at the rest of the data
+full %>% 
+  filter(passengerid != 62 & passengerid != 830) %>% 
+  ggplot() +
+  geom_boxplot(aes(embarked, fare, fill = factor(pclass))) +
+  geom_hline(aes(yintercept = 80)) +
+  scale_y_continuous(labels = dollar_format())
+
+# the median fare paid by first class passengers departing from Charbourg (C) coincides with the $80 paid by our passengers without embarkment info. Let's replace those "" values with "C"
+
+full$embarked[c(62,830)] <- 'C'
+
+```
+
+
+Fare missing values-- only 1
+```{r}
+missing_vals['fare'] 
+
+# this is a 3rd class passenger from Southhampton ('S')
+
+# what did 3rd class passengers from southhampton pay for a fare?
+
+full %>% 
+  filter(pclass == 3 & embarked == 'S') %>% 
+  ggplot() +
+  geom_density(aes(x = fare), fill = "lightblue", alpha = 0.5) + 
+  geom_vline(aes(xintercept = median(fare, na.rm = TRUE)), color = "red", linetype = "dashed", lwd = 1) +
+  scale_x_continuous(labels = dollar_format())
+
+
+# we will replace the missing value with the median of this group
+fare_med <- full %>% filter(pclass ==3 & embarked == 'S') %>% summarise(median = median(fare, na.rm = TRUE)) # $8.05
+
+full$fare[1044] <- fare_med
+```
+
+
+Predictive Imputation: Lots of missing age data  
+
+create a model that predicts agge from other variables!  
+```{r}
+sum(is.na(full$age)) # yikes
+
+# this is too much to do by hand.
+
+
+
+
+
+```
+
+
+
+
+
+
+    
+    
